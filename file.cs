@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Xml.Linq;
 using System.Linq;
+using System.Text.RegularExpressions;
 
 namespace XmlReader
 {
@@ -10,7 +11,7 @@ namespace XmlReader
         static void Main(string[] args)
         {
             string folderPath = @"C:\YourFolder"; // Update with your folder path
-            string searchText = "abc@johndeere.com";
+            string searchPattern = @"\S+@johndeere\.com"; // Regex pattern for *@johndeere.com
 
             try
             {
@@ -24,7 +25,7 @@ namespace XmlReader
 
                 foreach (string filePath in xmlFiles)
                 {
-                    ProcessXmlFile(filePath, searchText);
+                    ProcessXmlFile(filePath, searchPattern);
                 }
             }
             catch (Exception ex)
@@ -35,31 +36,35 @@ namespace XmlReader
             Console.ReadKey();
         }
 
-        static void ProcessXmlFile(string filePath, string searchText)
+        static void ProcessXmlFile(string filePath, string searchPattern)
         {
             try
             {
                 XDocument doc = XDocument.Load(filePath);
+                Regex regex = new Regex(searchPattern, RegexOptions.IgnoreCase);
 
-                var matchingElements = doc.Descendants()
-                    .Where(e => e.Value.Contains(searchText) || 
-                               e.Attributes().Any(a => a.Value.Contains(searchText)));
+                var allElements = doc.Descendants();
 
-                foreach (var element in matchingElements)
+                foreach (var element in allElements)
                 {
-                    // Print element value if it contains the search text
-                    if (!string.IsNullOrWhiteSpace(element.Value) && element.Value.Contains(searchText))
+                    // Check element value
+                    if (!string.IsNullOrWhiteSpace(element.Value))
                     {
-                        Console.WriteLine(element.Value.Trim());
+                        var matches = regex.Matches(element.Value);
+                        foreach (Match match in matches)
+                        {
+                            Console.WriteLine(match.Value);
+                        }
                     }
-                    
-                    // Print attribute values if they contain the search text
-                    var matchingAttrs = element.Attributes()
-                        .Where(a => a.Value.Contains(searchText));
-                    
-                    foreach (var attr in matchingAttrs)
+
+                    // Check attributes
+                    foreach (var attr in element.Attributes())
                     {
-                        Console.WriteLine(attr.Value);
+                        var matches = regex.Matches(attr.Value);
+                        foreach (Match match in matches)
+                        {
+                            Console.WriteLine(match.Value);
+                        }
                     }
                 }
             }
