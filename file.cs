@@ -3,6 +3,7 @@ using System.IO;
 using System.Xml.Linq;
 using System.Linq;
 using System.Text.RegularExpressions;
+using System.Collections.Generic;
 
 namespace XmlReader
 {
@@ -42,6 +43,7 @@ namespace XmlReader
             {
                 XDocument doc = XDocument.Load(filePath);
                 Regex regex = new Regex(searchPattern, RegexOptions.IgnoreCase);
+                HashSet<string> uniqueValues = new HashSet<string>();
 
                 var allElements = doc.Descendants();
 
@@ -53,7 +55,7 @@ namespace XmlReader
                         var matches = regex.Matches(element.Value);
                         foreach (Match match in matches)
                         {
-                            Console.WriteLine(match.Value);
+                            uniqueValues.Add(match.Value);
                         }
                     }
 
@@ -63,9 +65,21 @@ namespace XmlReader
                         var matches = regex.Matches(attr.Value);
                         foreach (Match match in matches)
                         {
-                            Console.WriteLine(match.Value);
+                            uniqueValues.Add(match.Value);
                         }
                     }
+                }
+
+                // Print results if any unique values found
+                if (uniqueValues.Count > 0)
+                {
+                    string fileName = Path.GetFileName(filePath);
+                    Console.WriteLine($"{fileName}:");
+                    foreach (var value in uniqueValues)
+                    {
+                        Console.WriteLine($"  {value}");
+                    }
+                    Console.WriteLine();
                 }
             }
             catch (Exception ex)
