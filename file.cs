@@ -13,6 +13,20 @@ namespace XmlReader
         {
             string folderPath = @"C:\YourFolder"; // Update with your folder path
             string searchPattern = @"\S+@johndeere\.com"; // Regex pattern for *@johndeere.com
+            string outputFile = Path.Combine(folderPath, "search_results.txt");
+
+            // Specific emails to count
+            List<string> emailsToCount = new List<string>
+            {
+                "abc@johndeere.com",
+                "test@johndeere.com"
+            };
+
+            Dictionary<string, int> emailCounts = new Dictionary<string, int>();
+            foreach (var email in emailsToCount)
+            {
+                emailCounts[email] = 0;
+            }
 
             try
             {
@@ -24,9 +38,28 @@ namespace XmlReader
                     return;
                 }
 
-                foreach (string filePath in xmlFiles)
+                using (StreamWriter writer = new StreamWriter(outputFile))
                 {
-                    ProcessXmlFile(filePath, searchPattern);
+                    foreach (string filePath in xmlFiles)
+                    {
+                        ProcessXmlFile(filePath, searchPattern, writer, emailCounts);
+                    }
+
+                    // Write count summary at the end
+                    writer.WriteLine();
+                    writer.WriteLine("=== Email Count Summary ===");
+                    foreach (var kvp in emailCounts)
+                    {
+                        writer.WriteLine($"{kvp.Key}: {kvp.Value}");
+                    }
+                }
+
+                Console.WriteLine($"Results saved to: {outputFile}");
+                Console.WriteLine();
+                Console.WriteLine("=== Email Count Summary ===");
+                foreach (var kvp in emailCounts)
+                {
+                    Console.WriteLine($"{kvp.Key}: {kvp.Value}");
                 }
             }
             catch (Exception ex)
@@ -37,13 +70,13 @@ namespace XmlReader
             Console.ReadKey();
         }
 
-        static void ProcessXmlFile(string filePath, string searchPattern)
+        static void ProcessXmlFile(string filePath, string searchPattern, StreamWriter writer, Dictionary<string, int> emailCounts)
         {
             try
             {
                 XDocument doc = XDocument.Load(filePath);
                 Regex regex = new Regex(searchPattern, RegexOptions.IgnoreCase);
-                HashSet<string> uniqueValues = new HashSet<string>();
+                List<string> foundValues = new List<string>();
 
                 var allElements = doc.Descendants();
 
@@ -55,7 +88,7 @@ namespace XmlReader
                         var matches = regex.Matches(element.Value);
                         foreach (Match match in matches)
                         {
-                            uniqueValues.Add(match.Value);
+                            foundValues.Add(match.Value);
                         }
                     }
 
@@ -65,26 +98,38 @@ namespace XmlReader
                         var matches = regex.Matches(attr.Value);
                         foreach (Match match in matches)
                         {
-                            uniqueValues.Add(match.Value);
+                            foundValues.Add(match.Value);
                         }
                     }
                 }
 
-                // Print results if any unique values found
-                if (uniqueValues.Count > 0)
+                // Count occurrences of specific emails
+                foreach (var value in foundValues)
+                {
+                    if (emailCounts.ContainsKey(value))
+                    {
+                        emailCounts[value]++;
+                    }
+                }
+
+                // Write results if any values found
+                if (foundValues.Count > 0)
                 {
                     string fileName = Path.GetFileName(filePath);
-                    Console.WriteLine($"{fileName}:");
+                    writer.WriteLine($"{fileName}:");
+                    
+                    HashSet<string> uniqueValues = new HashSet<string>(foundValues);
                     foreach (var value in uniqueValues)
                     {
-                        Console.WriteLine($"  {value}");
+                        writer.WriteLine($"  {value}");
                     }
-                    Console.WriteLine();
+                    
+                    writer.WriteLine();
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error: {ex.Message}");
+                writer.WriteLine($"Error processing file: {ex.Message}");
             }
         }
     }
