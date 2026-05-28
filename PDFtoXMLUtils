@@ -1,0 +1,356 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Xml.Linq;
+using UglyToad.PdfPig;
+using UglyToad.PdfPig.Content;
+
+// ── Data model ──────────────────────────────────────────────────────────────
+
+public class NoLoadTestResult
+{
+    public string  TestType      { get; set; }   // "NO LOAD TEST 100%"
+    public string  Winding       { get; set; }   // "HV"
+    public double  CurrentA      { get; set; }   // 601.424
+    public double  VoltageKV     { get; set; }   // 0.480
+    public double  ResistanceOhm { get; set; }   // 0.0066
+    public DateTime TestDateTime { get; set; }
+    public int     TapNumber     { get; set; }
+    public double  Frequency     { get; set; }   // 60.00
+
+    public PhaseData PhaseU { get; set; } = new();
+    public PhaseData PhaseV { get; set; } = new();
+    public PhaseData PhaseW { get; set; } = new();
+    public PhaseData Total  { get; set; } = new();
+}
+
+public class PhaseData
+{
+    public double ApparentPowerVA  { get; set; }
+    public double MeasuredWattsW   { get; set; }
+    public double PowerFactor      { get; set; }
+    public double CurrentRmsA      { get; set; }
+    public double VoltageLN_RmsV   { get; set; }  // LV-side line-to-neutral RMS
+    public double VoltageLN_MeanV  { get; set; }
+    public double CorrectedWatts   { get; set; }
+    public double VoltageLL_RmsV   { get; set; }  // HV-side line-to-line RMS
+    public double VoltageLL_MeanV  { get; set; }
+}
+
+// ── Extraction logic ─────────────────────────────────────────────────────────
+
+public static class NoLoadTestExtractor
+{
+    // Maximum vertical distance (in PDF points) for two words to be on the same row.
+    private const double RowTolerance = 5.0;
+
+    // Minimum horizontal gap (in PDF points) between two words to consider them
+    // belonging to different table columns.
+    private const double ColumnGapThreshold = 15.0;
+
+    /// <summary>
+    /// Open the PDF and parse the No-Load-Test table from the page that contains
+    /// "NO LOAD TEST 100%", regardless of page number.
+    /// </summary>
+    public static NoLoadTestResult Extract(string pdfPath, int pageNumber = 1)
+    {
+        using var doc = PdfDocument.Open(pdfPath);
+
+        List<Word> words = null;
+        for (int p = 1; p <= doc.NumberOfPages; p++)
+        {
+            var candidate = doc.GetPage(p).GetWords().ToList();
+            string fullText = string.Join(" ", candidate.Select(w => w.Text));
+            if (fullText.IndexOf("NO LOAD TEST 100", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                words = candidate;
+                break;
+            }
+        }
+
+        if (words == null)
+            throw new InvalidOperationException("No page containing 'NO LOAD TEST 100%' was found in the PDF.");
+
+
+        // Build rows: each row is a list of Word objects sorted left-to-right.
+        var rows = BuildRows(words);          // top-to-bottom order
+
+        var result    = new NoLoadTestResult();
+        var tableData = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+
+        // Track how many "Voltage(RMS)" / "Voltage(Mean)" rows we have seen
+        // so we can distinguish LN (first occurrence) from LL (second occurrence).
+        int voltageRmsCount  = 0;
+        int voltageMeanCount = 0;
+
+        foreach (var row in rows)
+        {
+            string rowText = JoinRow(row);
+
+            // ── Title line ────────────────────────────────────────────────
+            if (rowText.StartsWith("NO LOAD TEST", StringComparison.OrdinalIgnoreCase))
+            {
+                result.TestType = rowText;
+                continue;
+            }
+
+            // ── Winding / header line ─────────────────────────────────────
+            if (rowText.Contains("Winding") && rowText.Contains("Current"))
+            {
+                ParseWindingHeader(rowText, result);
+                continue;
+            }
+
+            // ── Skip column-header row ────────────────────────────────────
+            if (rowText.Contains("Phase U") || rowText.Contains("Parameters"))
+                continue;
+
+            // ── Data rows ─────────────────────────────────────────────────
+            var cells = SplitIntoCells(row);
+            if (cells.Count < 2) continue;
+
+            string paramName = cells[0];
+
+            // Frequency row only has one value (no per-phase split)
+            if (paramName.Equals("Frequency", StringComparison.OrdinalIgnoreCase))
+            {
+                result.Frequency = ParseDouble(cells.Count > 1 ? cells[1] : "0");
+                continue;
+            }
+
+            // DateTime row
+            if (paramName.Equals("DateTime", StringComparison.OrdinalIgnoreCase))
+            {
+                ParseDateTime(cells, result);
+                continue;
+            }
+
+            // Disambiguate duplicated "Voltage(RMS)(V)" and "Voltage(Mean)(V)" rows
+            string key = paramName;
+            if (paramName.Equals("Voltage(RMS)(V)", StringComparison.OrdinalIgnoreCase))
+            {
+                voltageRmsCount++;
+                key = voltageRmsCount == 1 ? "Voltage_LN_RMS" : "Voltage_LL_RMS";
+            }
+            else if (paramName.Equals("Voltage(Mean)(V)", StringComparison.OrdinalIgnoreCase))
+            {
+                voltageMeanCount++;
+                key = voltageMeanCount == 1 ? "Voltage_LN_Mean" : "Voltage_LL_Mean";
+            }
+
+            // Store [U, V, W, Total] values
+            tableData[key] = new[]
+            {
+                cells.Count > 1 ? cells[1] : "",
+                cells.Count > 2 ? cells[2] : "",
+                cells.Count > 3 ? cells[3] : "",
+                cells.Count > 4 ? cells[4] : ""
+            };
+        }
+
+        // ── Map raw strings to typed model ────────────────────────────────
+        MapToModel(tableData, result);
+        return result;
+    }
+
+    // ── Row / cell helpers ────────────────────────────────────────────────
+
+    /// <summary>Groups words into rows by their Y centre, returns rows top-to-bottom.</summary>
+    private static List<List<Word>> BuildRows(List<Word> words)
+    {
+        // Each bucket: representative Y → words in that row
+        var buckets = new List<(double y, List<Word> words)>();
+
+        foreach (var word in words)
+        {
+            double cy = (word.BoundingBox.Bottom + word.BoundingBox.Top) / 2.0;
+
+            var match = buckets.FirstOrDefault(b => Math.Abs(b.y - cy) <= RowTolerance);
+            if (match.words == null)
+                buckets.Add((cy, new List<Word> { word }));
+            else
+                match.words.Add(word);
+        }
+
+        // Sort top-to-bottom (PDF Y grows upward, so higher Y = higher on page)
+        return buckets
+            .OrderByDescending(b => b.y)
+            .Select(b => b.words.OrderBy(w => w.BoundingBox.Left).ToList())
+            .ToList();
+    }
+
+    /// <summary>Concatenates all words in a row with a single space.</summary>
+    private static string JoinRow(List<Word> row)
+        => string.Join(" ", row.Select(w => w.Text));
+
+    /// <summary>
+    /// Splits a sorted row into cells by detecting large horizontal gaps between words.
+    /// </summary>
+    private static List<string> SplitIntoCells(List<Word> row)
+    {
+        var cells       = new List<string>();
+        var currentCell = new List<string>();
+
+        for (int i = 0; i < row.Count; i++)
+        {
+            currentCell.Add(row[i].Text);
+
+            bool lastWord = i == row.Count - 1;
+            if (!lastWord)
+            {
+                double gap = row[i + 1].BoundingBox.Left - row[i].BoundingBox.Right;
+                if (gap >= ColumnGapThreshold)
+                {
+                    cells.Add(string.Join(" ", currentCell));
+                    currentCell.Clear();
+                }
+            }
+        }
+        if (currentCell.Count > 0)
+            cells.Add(string.Join(" ", currentCell));
+
+        return cells;
+    }
+
+    // ── Parsing helpers ───────────────────────────────────────────────────
+
+    private static void ParseWindingHeader(string text, NoLoadTestResult r)
+    {
+        // Example: "Winding: HV Tap No: Current: 601.424 A Voltage: 0.480 kV Res: 0.0066 ohm"
+        r.Winding = ExtractAfter(text, "Winding:", "Tap").Trim().TrimEnd(':');
+
+        string currentStr = ExtractAfter(text, "Current:", "A").Trim();
+        r.CurrentA = ParseDouble(currentStr);
+
+        string voltageStr = ExtractAfter(text, "Voltage:", "kV").Trim();
+        r.VoltageKV = ParseDouble(voltageStr);
+
+        string resStr = ExtractAfter(text, "Res:", "ohm").Trim();
+        r.ResistanceOhm = ParseDouble(resStr);
+    }
+
+    private static void ParseDateTime(List<string> cells, NoLoadTestResult r)
+    {
+        // cells[1] = "16-05-2026", cells[2] = "11:48:43", cells[3] = "TAP=0"
+        if (cells.Count > 1 && DateTime.TryParseExact(
+                $"{cells[1]} {(cells.Count > 2 ? cells[2] : "00:00:00")}",
+                "dd-MM-yyyy HH:mm:ss",
+                null,
+                System.Globalization.DateTimeStyles.None,
+                out var dt))
+        {
+            r.TestDateTime = dt;
+        }
+
+        foreach (var cell in cells)
+        {
+            if (cell.StartsWith("TAP=", StringComparison.OrdinalIgnoreCase) &&
+                int.TryParse(cell.Substring(4), out int tap))
+            {
+                r.TapNumber = tap;
+            }
+        }
+    }
+
+    private static void MapToModel(Dictionary<string, string[]> d, NoLoadTestResult r)
+    {
+        void Fill(PhaseData p, int idx)
+        {
+            p.ApparentPowerVA = GetVal(d, "App. Power(VA)",   idx);
+            p.MeasuredWattsW  = GetVal(d, "Meas.Watts(W)",   idx);
+            p.PowerFactor     = GetVal(d, "Power Factor",     idx);
+            p.CurrentRmsA     = GetVal(d, "Current(RMS)(A)",  idx);
+            p.VoltageLN_RmsV  = GetVal(d, "Voltage_LN_RMS",  idx);
+            p.VoltageLN_MeanV = GetVal(d, "Voltage_LN_Mean", idx);
+            p.CorrectedWatts  = GetVal(d, "Corrected Watts",  idx);
+            p.VoltageLL_RmsV  = GetVal(d, "Voltage_LL_RMS",  idx);
+            p.VoltageLL_MeanV = GetVal(d, "Voltage_LL_Mean", idx);
+        }
+
+        Fill(r.PhaseU, 0);
+        Fill(r.PhaseV, 1);
+        Fill(r.PhaseW, 2);
+        Fill(r.Total,  3);
+    }
+
+    private static double GetVal(Dictionary<string, string[]> d, string key, int idx)
+        => d.TryGetValue(key, out var arr) && arr.Length > idx
+            ? ParseDouble(arr[idx])
+            : 0;
+
+    private static double ParseDouble(string s)
+    {
+        // Handle "1.031 k" → 1031  or plain "182.994"
+        s = s.Trim();
+        double multiplier = 1.0;
+        if (s.EndsWith(" k", StringComparison.OrdinalIgnoreCase) ||
+            s.EndsWith("k",  StringComparison.OrdinalIgnoreCase))
+        {
+            multiplier = 1000.0;
+            s = s.TrimEnd('k', 'K', ' ');
+        }
+        return double.TryParse(s,
+            System.Globalization.NumberStyles.Any,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out double v) ? v * multiplier : 0;
+    }
+
+    private static string ExtractAfter(string text, string startMarker, string endMarker)
+    {
+        int start = text.IndexOf(startMarker, StringComparison.OrdinalIgnoreCase);
+        if (start < 0) return "";
+        start += startMarker.Length;
+        int end = text.IndexOf(endMarker, start, StringComparison.OrdinalIgnoreCase);
+        return end < 0 ? text.Substring(start) : text.Substring(start, end - start);
+    }
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+class Program
+{
+    static void Main(string[] args)
+    {
+        string pdfPath = args.Length > 0 ? args[0] : "report.pdf";
+
+        var result = NoLoadTestExtractor.Extract(pdfPath);
+        var xml    = ToXml(result);
+
+        Console.WriteLine(xml.ToString());
+    }
+
+    static XDocument ToXml(NoLoadTestResult r)
+    {
+        static XElement Phase(string name, PhaseData p) => new XElement(name,
+            new XElement("ApparentPowerVA",  p.ApparentPowerVA),
+            new XElement("MeasuredWattsW",   p.MeasuredWattsW),
+            new XElement("PowerFactor",      p.PowerFactor),
+            new XElement("CurrentRmsA",      p.CurrentRmsA),
+            new XElement("VoltageLN_RmsV",   p.VoltageLN_RmsV),
+            new XElement("VoltageLN_MeanV",  p.VoltageLN_MeanV),
+            new XElement("CorrectedWatts",   p.CorrectedWatts),
+            new XElement("VoltageLL_RmsV",   p.VoltageLL_RmsV),
+            new XElement("VoltageLL_MeanV",  p.VoltageLL_MeanV)
+        );
+
+        return new XDocument(
+            new XDeclaration("1.0", "utf-8", null),
+            new XElement("NoLoadTest",
+                new XElement("TestType",      r.TestType),
+                new XElement("Winding",       r.Winding),
+                new XElement("CurrentA",      r.CurrentA),
+                new XElement("VoltageKV",     r.VoltageKV),
+                new XElement("ResistanceOhm", r.ResistanceOhm),
+                new XElement("FrequencyHz",   r.Frequency),
+                new XElement("DateTime",      r.TestDateTime.ToString("yyyy-MM-ddTHH:mm:ss")),
+                new XElement("TapNumber",     r.TapNumber),
+                Phase("PhaseU", r.PhaseU),
+                Phase("PhaseV", r.PhaseV),
+                Phase("PhaseW", r.PhaseW),
+                Phase("Total",  r.Total)
+            )
+        );
+    }
+
+
+}
